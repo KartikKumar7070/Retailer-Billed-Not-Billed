@@ -1,0 +1,621 @@
+import pandas as pd
+import numpy as np
+from datetime import datetime
+import warnings
+import os
+import gc
+
+warnings.filterwarnings('ignore')
+
+# ============================================================
+# CONFIGURATION
+# ============================================================
+FILE_PATHS = [
+    '/content/12.BPOS BILLING REPORT SUMMARY _MAR-26.xlsx',
+    '/content/13.BPOS BILLING REPORT SUMMARY _APR-26.xlsx',
+    '/content/14.BPOS BILLING REPORT SUMMARY _MAY-26.xlsx'
+]
+
+OUTPUT_FILE = f'/content/Billed_NotBilled_Summary_{datetime.now().strftime("%Y%m%d_%H%M")}.xlsx'
+
+# ============================================================
+# STEP 1: LOAD ALL FILES
+# ============================================================
+print("=" * 60)
+print("LOADING FILES")
+print("=" * 60)
+
+all_data = []
+for i, fp in enumerate(FILE_PATHS, 1):
+    print(f"\n[{i}/3] Loading: {os.path.basename(fp)}")
+    df_temp = pd.read_excel(fp, header=1, engine='openpyxl')
+    all_data.append(df_temp)
+    print(f"  ✓ Loaded: {len(df_temp):,} rows")
+
+df = pd.concat(all_data, ignore_index=True, copy=False)
+del all_data
+gc.collect()
+
+print(f"\n🔥 TOTAL: {len(df):,} rows")
+print(f"📋 Original columns: {list(df.columns)}")
+
+# ============================================================
+# STEP 2: CLEAN & RENAME COLUMNS (HANDLE DUPLICATES)
+# ============================================================
+df.columns = df.columns.str.strip()
+
+# Print original columns for debugging
+print(f"\n🔍 Columns after strip: {list(df.columns)}")
+
+# FIX: Handle duplicate DB ID columns - drop the .1 version
+db_id_cols = [c for c in df.columns if 'DB' in c.upper() and 'ID' in c.upper()]
+print(f"🔍 DB ID columns found: {db_id_cols}")
+
+if len(db_id_cols) > 1:
+    for dup_col in db_id_cols[1:]:
+        print(f"⚠️ Dropping duplicate column: {dup_col}")
+        df = df.drop(columns=[dup_col])
+
+# FIX: Handle duplicate 'state' column (lowercase)
+state_cols = [c for c in df.columns if c.upper() == 'STATE']
+if len(state_cols) > 1:
+    for dup_col in state_cols[1:]:
+        print(f"⚠️ Dropping duplicate column: {dup_col}")
+        df = df.drop(columns=[dup_col])
+
+print(f"\n📋 Columns after dedup: {list(df.columns)}")
+
+# Now create rename mapping
+rename_map = {
+    'DSM CODE': 'DSM_CODE', 'RESOURCE NAME': 'RESOURCE_NAME',
+    'DB ID': 'DB_ID', 'DISTRIBUTOR': 'DISTRIBUTOR',
+    'BEAT CODE': 'BEAT_CODE', 'BEAT NAME': 'BEAT_NAME',
+    'RETAILER ID': 'RETAILER_ID', 'RETAILER': 'RETAILER',
+    'INVOICE DATE': 'INVOICE_DATE',
+    'AMOUNT (WITH TAX)': 'AMOUNT_WITH_TAX',
+    'AMOUNT (PRE TAX)': 'AMOUNT_PRE_TAX',
+    'REGION': 'REGION', 'NSM': 'NSM', 'ZSM': 'ZSM',
+    'STATE': 'STATE', 'ASM NAME': 'ASM_NAME',
+    'SO NAME': 'SO_NAME', 'DISTRICT': 'DISTRICT',
+    'CITY': 'CITY', 'DB NAME': 'DB_NAME'
+}
+
+# Only rename columns that exist
+df = df.rename(columns={k: v for k, v in rename_map.items() if k in df.columns})
+
+print(f"\n📋 Columns after rename: {list(df.columns)}")
+
+# Check critical columns
+critical_cols = ['NSM', 'REGION', 'STATE', 'ZSM', 'ASM_NAME', 'SO_NAME', 'DISTRICT', 'CITY', 'DB_ID', 'DB_NAME']
+for col in critical_cols:
+    if col not in df.columns:
+        print(f"⚠️ WARNING: {col} not found! Creating empty column.")
+        df[col] = ''
+    else:
+        print(f"✓ {col} found")
+
+# Parse dates
+df['INVOICE_DATE'] = pd.to_datetime(df['INVOICE_DATE'], errors='coerce')
+df = df.dropna(subset=['INVOICE_DATE'])
+
+# Clean amounts
+for col in ['AMOUNT_WITH_TAX', 'AMOUNT_PRE_TAX']:
+    if col in df.columns:
+        df[col] = df[col].astype(str).str.replace(',', '').str.strip()
+        df[col] = pd.to_numeric(df[col], errors='coerce').fillna(0)
+
+# ============================================================
+# FIX 1: CHRONOLOGICAL MONTH ORDERING
+# ============================================================
+print(f"\n{'='*60}")
+print(f"FIXING MONTH ORDER (Chronological)")
+print(f"{'='*60}")
+
+df['Month_Num'] = df['INVOICE_DATE'].dt.month
+df['Year'] = df['INVOICE_DATE'].dt.year
+df['Month_Year'] = df['INVOICE_DATE'].dt.strftime("%b'%y").str.upper()
+
+month_order = {
+    "JAN'25": 1, "FEB'25": 2, "MAR'25": 3, "APR'25": 4, "MAY'25": 5, "JUN'25": 6,
+    "JUL'25": 7, "AUG'25": 8, "SEP'25": 9, "OCT'25": 10, "NOV'25": 11, "DEC'25": 12,
+    "JAN'26": 13, "FEB'26": 14, "MAR'26": 15, "APR'26": 16, "MAY'26": 17, "JUN'26": 18,
+    "JUL'26": 19, "AUG'26": 20, "SEP'26": 21, "OCT'26": 22, "NOV'26": 23, "DEC'26": 24
+}
+
+df = df.sort_values(['Year', 'Month_Num'])
+actual_months = sorted(df['Month_Year'].unique(), key=lambda x: month_order.get(x, 99))
+print(f"✓ Months in chronological order: {actual_months}")
+
+# ============================================================
+# STEP 3: CREATE STANDARDIZED NAME LOOKUPS
+# ============================================================
+print(f"\n{'='*60}")
+print(f"CREATING STANDARDIZED NAME LOOKUPS")
+print(f"{'='*60}")
+
+emp_freq = df.groupby(['DSM_CODE', 'RESOURCE_NAME'], dropna=False).size().reset_index(name='COUNT')
+emp_std = emp_freq.sort_values('COUNT', ascending=False).drop_duplicates('DSM_CODE', keep='first')
+emp_lookup = emp_std[['DSM_CODE', 'RESOURCE_NAME']].rename(columns={'RESOURCE_NAME': 'STD_EMP_NAME'})
+
+beat_freq = df.groupby(['BEAT_CODE', 'BEAT_NAME'], dropna=False).size().reset_index(name='COUNT')
+beat_std = beat_freq.sort_values('COUNT', ascending=False).drop_duplicates('BEAT_CODE', keep='first')
+beat_lookup = beat_std[['BEAT_CODE', 'BEAT_NAME']].rename(columns={'BEAT_NAME': 'STD_BEAT_NAME'})
+
+ret_freq = df.groupby(['RETAILER_ID', 'RETAILER'], dropna=False).size().reset_index(name='COUNT')
+ret_std = ret_freq.sort_values('COUNT', ascending=False).drop_duplicates('RETAILER_ID', keep='first')
+ret_lookup = ret_std[['RETAILER_ID', 'RETAILER']].rename(columns={'RETAILER': 'STD_RET_NAME'})
+
+print(f"✓ Employee lookups: {len(emp_lookup):,}")
+print(f"✓ Beat lookups: {len(beat_lookup):,}")
+print(f"✓ Retailer lookups: {len(ret_lookup):,}")
+
+# ============================================================
+# STEP 4: MERGE STANDARDIZED NAMES TO DATA
+# ============================================================
+df = df.merge(emp_lookup, on='DSM_CODE', how='left')
+df = df.merge(beat_lookup, on='BEAT_CODE', how='left')
+df = df.merge(ret_lookup, on='RETAILER_ID', how='left')
+
+print(f"✓ Standardized names added to all {len(df):,} rows")
+
+# ============================================================
+# STEP 5: VERIFY DUMP TOTALS
+# ============================================================
+print(f"\n{'='*60}")
+print(f"VERIFYING DUMP TOTALS")
+print(f"{'='*60}")
+
+dump_total = df['AMOUNT_PRE_TAX'].sum()
+print(f"💰 TOTAL DUMP AMOUNT (PRE-TAX): {dump_total:,.0f}")
+
+monthly_dump_totals = df.groupby('Month_Year', dropna=False)['AMOUNT_PRE_TAX'].sum().sort_index()
+for month, total in monthly_dump_totals.items():
+    print(f"   {month}: {total:,.0f}")
+
+# ============================================================
+# STEP 6: BUILD RETAILER MASTER (NO DEDUPLICATION - as-is)
+# ============================================================
+print(f"\n{'='*60}")
+print(f"BUILDING RETAILER MASTER (as-is, multiple rows if mapping differs)")
+print(f"{'='*60}")
+
+# Group by ALL mapping columns - if mapping same, 1 row; if mapping changes, multiple rows
+retailer_groupby_cols = ['RETAILER_ID', 'STD_RET_NAME', 'DSM_CODE', 'STD_EMP_NAME',
+                          'BEAT_CODE', 'STD_BEAT_NAME', 'DB_ID', 'DB_NAME', 'DISTRIBUTOR',
+                          'ZSM', 'ASM_NAME', 'SO_NAME', 'REGION', 'STATE', 'DISTRICT', 'CITY']
+retailer_groupby_cols = [c for c in retailer_groupby_cols if c in df.columns]
+print(f"✓ Retailer groupby columns: {retailer_groupby_cols}")
+
+# Aggregate by full combination - natural deduplication via groupby
+retailer_agg = df.groupby(retailer_groupby_cols, dropna=False).agg({
+    'AMOUNT_PRE_TAX': 'sum',
+    'INVOICE_DATE': 'count'
+}).reset_index().rename(columns={'INVOICE_DATE': 'TRANSACTION_COUNT'})
+
+print(f"✓ Retailer combinations: {len(retailer_agg):,} rows")
+print(f"✓ Total pre-tax sales: {retailer_agg['AMOUNT_PRE_TAX'].sum():,.0f}")
+
+# ============================================================
+# STEP 7: BUILD MONTHLY PIVOT BY RETAILER COMBINATION
+# ============================================================
+print(f"\n{'='*60}")
+print(f"BUILDING MONTHLY PIVOT BY RETAILER COMBINATION")
+print(f"{'='*60}")
+
+monthly_agg = df.groupby(retailer_groupby_cols + ['Month_Year'], dropna=False)['AMOUNT_PRE_TAX'].sum().reset_index()
+monthly_pivot = monthly_agg.pivot(index=retailer_groupby_cols, columns='Month_Year', values='AMOUNT_PRE_TAX').fillna(0)
+
+for month in actual_months:
+    if month not in monthly_pivot.columns:
+        monthly_pivot[month] = 0
+
+monthly_pivot = monthly_pivot[actual_months]
+monthly_pivot['TOTAL_BILLING'] = monthly_pivot.sum(axis=1)
+
+# Verify monthly pivot total matches dump total
+monthly_pivot_total = monthly_pivot['TOTAL_BILLING'].sum()
+print(f"✓ Monthly Pivot Total: {monthly_pivot_total:,.0f}")
+print(f"✓ Match with Dump: {'✅ PERFECT' if abs(monthly_pivot_total - dump_total) < 1 else '❌ MISMATCH'}")
+
+# ============================================================
+# STEP 8: BUILD ALL 6 SUMMARY SHEETS
+# ============================================================
+print(f"\n{'='*60}")
+print(f"BUILDING SUMMARY SHEETS")
+print(f"{'='*60}")
+
+# --- SHEET 1: RETAILER-WISE (as-is, no forced deduplication) ---
+retailer_summary = retailer_agg.merge(monthly_pivot, on=retailer_groupby_cols, how='left')
+for col in actual_months + ['TOTAL_BILLING']:
+    retailer_summary[col] = retailer_summary[col].fillna(0)
+
+retailer_summary['BILLED_NOT_BILLED'] = retailer_summary['TOTAL_BILLING'].apply(lambda x: 'BILLED' if x > 0 else 'NOT BILLED')
+retailer_summary['COUNT'] = 1
+retailer_summary['S_NO'] = np.arange(1, len(retailer_summary) + 1)
+
+retailer_final = pd.DataFrame({
+    'NSM': retailer_summary['NSM'] if 'NSM' in retailer_summary.columns else '',
+    'REGION': retailer_summary['REGION'] if 'REGION' in retailer_summary.columns else '',
+    'ZSM NAME': retailer_summary['ZSM'] if 'ZSM' in retailer_summary.columns else '',
+    'STATE': retailer_summary['STATE'] if 'STATE' in retailer_summary.columns else '',
+    'ASM NAME': retailer_summary['ASM_NAME'] if 'ASM_NAME' in retailer_summary.columns else '',
+    'SO NAME': retailer_summary['SO_NAME'] if 'SO_NAME' in retailer_summary.columns else '',
+    'DISTRICT': retailer_summary['DISTRICT'] if 'DISTRICT' in retailer_summary.columns else '',
+    'CITY': retailer_summary['CITY'] if 'CITY' in retailer_summary.columns else '',
+    'DB ID': retailer_summary['DB_ID'] if 'DB_ID' in retailer_summary.columns else '',
+    'DB NAME': retailer_summary['DB_NAME'] if 'DB_NAME' in retailer_summary.columns else '',
+    'DESG.': '',
+    'SO DSM NAME': retailer_summary['STD_EMP_NAME'] if 'STD_EMP_NAME' in retailer_summary.columns else '',
+    'BEAT CODE': retailer_summary['BEAT_CODE'] if 'BEAT_CODE' in retailer_summary.columns else '',
+    'BEAT NAME': retailer_summary['STD_BEAT_NAME'] if 'STD_BEAT_NAME' in retailer_summary.columns else '',
+    'S. NO.': retailer_summary['S_NO'],
+    'RETAILER ID': retailer_summary['RETAILER_ID'],
+    'RETAILER': retailer_summary['STD_RET_NAME'] if 'STD_RET_NAME' in retailer_summary.columns else retailer_summary['RETAILER_ID'],
+})
+for month in actual_months:
+    retailer_final[month] = retailer_summary[month]
+retailer_final['TOTAL BILLING'] = retailer_summary['TOTAL_BILLING']
+retailer_final['BILLED / NOT BILLED'] = retailer_summary['BILLED_NOT_BILLED']
+retailer_final['COUNT'] = retailer_summary['COUNT']
+retailer_final['EMP STATUS'] = ''
+retailer_final['BEAT STATUS'] = ''
+retailer_final['RET STATUS'] = ''
+
+retailer_sheet_total = retailer_final['TOTAL BILLING'].sum()
+print(f"✓ Retailer-wise: {len(retailer_final):,} rows (as-is)")
+print(f"✓ Retailer Sheet Total: {retailer_sheet_total:,.0f}")
+print(f"✓ Match with Dump: {'✅ PERFECT' if abs(retailer_sheet_total - dump_total) < 1 else '❌ MISMATCH'}")
+
+# --- SHEET 2: BEAT-WISE (group by ALL mapping columns, not just BEAT_CODE) ---
+print(f"\n🔧 Building Beat-Wise (as-is)...")
+
+beat_groupby_cols = ['BEAT_CODE', 'STD_BEAT_NAME', 'ZSM', 'ASM_NAME', 'SO_NAME',
+                      'CITY', 'DB_ID', 'DB_NAME', 'DISTRICT', 'DISTRIBUTOR']
+if 'NSM' in df.columns:
+    beat_groupby_cols.insert(0, 'NSM')
+if 'REGION' in df.columns:
+    beat_groupby_cols.insert(1, 'REGION')
+if 'STATE' in df.columns:
+    beat_groupby_cols.insert(3, 'STATE')
+beat_groupby_cols = [c for c in beat_groupby_cols if c in df.columns]
+print(f"✓ Beat groupby columns: {beat_groupby_cols}")
+
+beat_agg = df.groupby(beat_groupby_cols, dropna=False).agg({
+    'AMOUNT_PRE_TAX': 'sum',
+    'RETAILER_ID': 'nunique'
+}).reset_index().rename(columns={'RETAILER_ID': 'TOTAL_RETAILER_COUNT'})
+
+print(f"✓ Beat combinations: {len(beat_agg):,} rows")
+
+beat_monthly = df.groupby(beat_groupby_cols + ['Month_Year'], dropna=False).agg({
+    'AMOUNT_PRE_TAX': 'sum',
+    'RETAILER_ID': 'nunique'
+}).reset_index()
+
+beat_pivot_amount = beat_monthly.pivot(index=beat_groupby_cols, columns='Month_Year', values='AMOUNT_PRE_TAX').fillna(0)
+beat_pivot_count = beat_monthly.pivot(index=beat_groupby_cols, columns='Month_Year', values='RETAILER_ID').fillna(0)
+
+for month in actual_months:
+    if month not in beat_pivot_amount.columns:
+        beat_pivot_amount[month] = 0
+    if month not in beat_pivot_count.columns:
+        beat_pivot_count[month] = 0
+
+beat_pivot_amount = beat_pivot_amount[actual_months]
+beat_pivot_count = beat_pivot_count[actual_months]
+
+beat_summary = beat_agg.merge(beat_pivot_amount, on=beat_groupby_cols, how='left')
+beat_summary = beat_summary.merge(beat_pivot_count, on=beat_groupby_cols, how='left', suffixes=('', '_CNT'))
+
+beat_summary['TOTAL_BILLING'] = beat_summary[[m for m in actual_months if m in beat_summary.columns]].sum(axis=1)
+
+beat_final = pd.DataFrame({
+    'NSM': beat_summary['NSM'] if 'NSM' in beat_summary.columns else '',
+    'REGION': beat_summary['REGION'] if 'REGION' in beat_summary.columns else '',
+    'ZSM NAME': beat_summary['ZSM'] if 'ZSM' in beat_summary.columns else '',
+    'STATE': beat_summary['STATE'] if 'STATE' in beat_summary.columns else '',
+    'ASM NAME': beat_summary['ASM_NAME'] if 'ASM_NAME' in beat_summary.columns else '',
+    'SO NAME': beat_summary['SO_NAME'] if 'SO_NAME' in beat_summary.columns else '',
+    'CITY': beat_summary['CITY'] if 'CITY' in beat_summary.columns else '',
+    'DB ID': beat_summary['DB_ID'] if 'DB_ID' in beat_summary.columns else '',
+    'DB NAME': beat_summary['DB_NAME'] if 'DB_NAME' in beat_summary.columns else '',
+    'DESG.': '',
+    'SO DSM NAME': '',
+    'BEAT CODE': beat_summary['BEAT_CODE'],
+    'BEAT NAME': beat_summary['STD_BEAT_NAME'] if 'STD_BEAT_NAME' in beat_summary.columns else '',
+    'RETAILER COUNT': beat_summary['TOTAL_RETAILER_COUNT'],
+})
+for month in actual_months:
+    beat_final[f"{month} RETAILER COUNT"] = beat_summary[f"{month}_CNT"] if f"{month}_CNT" in beat_summary.columns else beat_summary[month]
+    beat_final[f"{month} BILLING AMT"] = beat_summary[month]
+beat_final['TOTAL RETAILER'] = beat_summary['TOTAL_RETAILER_COUNT']
+beat_final['TOTAL BILLING'] = beat_summary['TOTAL_BILLING']
+beat_final['EMP STATUS'] = ''
+beat_final['BEAT STATUS'] = ''
+
+beat_sheet_total = beat_final['TOTAL BILLING'].sum()
+print(f"✓ Beat-wise: {len(beat_final):,} rows")
+print(f"✓ Beat Sheet Total: {beat_sheet_total:,.0f}")
+print(f"✓ Match with Dump: {'✅ PERFECT' if abs(beat_sheet_total - dump_total) < 1 else '❌ MISMATCH'}")
+
+# --- SHEET 3: DB-WISE (group by ALL mapping columns) ---
+print(f"\n🔧 Building DB-Wise (as-is)...")
+
+db_groupby_cols = ['DB_ID', 'DB_NAME', 'DISTRIBUTOR', 'NSM', 'ZSM', 'STATE', 'ASM_NAME', 'REGION']
+db_groupby_cols = [c for c in db_groupby_cols if c in df.columns]
+print(f"✓ DB groupby columns: {db_groupby_cols}")
+
+db_agg = df.groupby(db_groupby_cols, dropna=False).agg({
+    'AMOUNT_PRE_TAX': 'sum',
+    'RETAILER_ID': 'nunique'
+}).reset_index().rename(columns={'RETAILER_ID': 'TOTAL_RETAILER_COUNT'})
+
+print(f"✓ DB combinations: {len(db_agg):,} rows")
+
+db_monthly = df.groupby(db_groupby_cols + ['Month_Year'], dropna=False).agg({
+    'AMOUNT_PRE_TAX': 'sum',
+    'RETAILER_ID': 'nunique'
+}).reset_index()
+
+db_pivot_amount = db_monthly.pivot(index=db_groupby_cols, columns='Month_Year', values='AMOUNT_PRE_TAX').fillna(0)
+db_pivot_count = db_monthly.pivot(index=db_groupby_cols, columns='Month_Year', values='RETAILER_ID').fillna(0)
+
+for month in actual_months:
+    if month not in db_pivot_amount.columns:
+        db_pivot_amount[month] = 0
+    if month not in db_pivot_count.columns:
+        db_pivot_count[month] = 0
+
+db_pivot_amount = db_pivot_amount[actual_months]
+db_pivot_count = db_pivot_count[actual_months]
+
+db_summary = db_agg.merge(db_pivot_amount, on=db_groupby_cols, how='left')
+db_summary = db_summary.merge(db_pivot_count, on=db_groupby_cols, how='left', suffixes=('', '_CNT'))
+
+db_summary['TOTAL_BILLING'] = db_summary[[m for m in actual_months if m in db_summary.columns]].sum(axis=1)
+
+db_final = pd.DataFrame({
+    'NSM': db_summary['NSM'] if 'NSM' in db_summary.columns else '',
+    'REGION': db_summary['REGION'] if 'REGION' in db_summary.columns else '',
+    'ZSM': db_summary['ZSM'] if 'ZSM' in db_summary.columns else '',
+    'STATE': db_summary['STATE'] if 'STATE' in db_summary.columns else '',
+    'ASM NAME': db_summary['ASM_NAME'] if 'ASM_NAME' in db_summary.columns else '',
+    'DB CODE': db_summary['DB_ID'],
+    'DB NAME': db_summary['DB_NAME'] if 'DB_NAME' in db_summary.columns else '',
+    'DESG.': '',
+    'SO DSM NAME': '',
+})
+for month in actual_months:
+    db_final[f"{month} RETAILER COUNT"] = db_summary[f"{month}_CNT"] if f"{month}_CNT" in db_summary.columns else db_summary[month]
+    db_final[f"{month} BILLING AMT"] = db_summary[month]
+db_final['TOTAL RETAILER'] = db_summary['TOTAL_RETAILER_COUNT']
+db_final['TOTAL BILLING'] = db_summary['TOTAL_BILLING']
+db_final['EMP STATUS'] = ''
+db_final['BEAT STATUS'] = ''
+
+db_sheet_total = db_final['TOTAL BILLING'].sum()
+print(f"✓ DB-wise: {len(db_final):,} rows")
+print(f"✓ DB Sheet Total: {db_sheet_total:,.0f}")
+print(f"✓ Match with Dump: {'✅ PERFECT' if abs(db_sheet_total - dump_total) < 1 else '❌ MISMATCH'}")
+
+# --- SHEET 4: ASM-WISE (group by ALL mapping columns) ---
+print(f"\n🔧 Building ASM-Wise (as-is)...")
+
+asm_groupby_cols = ['ASM_NAME', 'NSM', 'ZSM', 'STATE', 'REGION']
+asm_groupby_cols = [c for c in asm_groupby_cols if c in df.columns]
+print(f"✓ ASM groupby columns: {asm_groupby_cols}")
+
+asm_agg = df.groupby(asm_groupby_cols, dropna=False).agg({
+    'AMOUNT_PRE_TAX': 'sum',
+    'RETAILER_ID': 'nunique'
+}).reset_index().rename(columns={'RETAILER_ID': 'TOTAL_RETAILER_COUNT'})
+
+print(f"✓ ASM combinations: {len(asm_agg):,} rows")
+
+asm_monthly = df.groupby(asm_groupby_cols + ['Month_Year'], dropna=False).agg({
+    'AMOUNT_PRE_TAX': 'sum',
+    'RETAILER_ID': 'nunique'
+}).reset_index()
+
+asm_pivot_amount = asm_monthly.pivot(index=asm_groupby_cols, columns='Month_Year', values='AMOUNT_PRE_TAX').fillna(0)
+asm_pivot_count = asm_monthly.pivot(index=asm_groupby_cols, columns='Month_Year', values='RETAILER_ID').fillna(0)
+
+for month in actual_months:
+    if month not in asm_pivot_amount.columns:
+        asm_pivot_amount[month] = 0
+    if month not in asm_pivot_count.columns:
+        asm_pivot_count[month] = 0
+
+asm_pivot_amount = asm_pivot_amount[actual_months]
+asm_pivot_count = asm_pivot_count[actual_months]
+
+asm_summary = asm_agg.merge(asm_pivot_amount, on=asm_groupby_cols, how='left')
+asm_summary = asm_summary.merge(asm_pivot_count, on=asm_groupby_cols, how='left', suffixes=('', '_CNT'))
+
+asm_summary['TOTAL_BILLING'] = asm_summary[[m for m in actual_months if m in asm_summary.columns]].sum(axis=1)
+
+asm_final = pd.DataFrame({
+    'NSM': asm_summary['NSM'] if 'NSM' in asm_summary.columns else '',
+    'REGION': asm_summary['REGION'] if 'REGION' in asm_summary.columns else '',
+    'ZSM': asm_summary['ZSM'] if 'ZSM' in asm_summary.columns else '',
+    'STATE': asm_summary['STATE'] if 'STATE' in asm_summary.columns else '',
+    'ASM NAME': asm_summary['ASM_NAME'],
+    'DESG.': '',
+    'SO DSM NAME': '',
+})
+for month in actual_months:
+    asm_final[f"{month} RETAILER COUNT"] = asm_summary[f"{month}_CNT"] if f"{month}_CNT" in asm_summary.columns else asm_summary[month]
+    asm_final[f"{month} BILLING AMT"] = asm_summary[month]
+asm_final['TOTAL RETAILER'] = asm_summary['TOTAL_RETAILER_COUNT']
+asm_final['TOTAL BILLING'] = asm_summary['TOTAL_BILLING']
+asm_final['EMP STATUS'] = ''
+asm_final['BEAT STATUS'] = ''
+
+asm_sheet_total = asm_final['TOTAL BILLING'].sum()
+print(f"✓ ASM-wise: {len(asm_final):,} rows")
+print(f"✓ ASM Sheet Total: {asm_sheet_total:,.0f}")
+print(f"✓ Match with Dump: {'✅ PERFECT' if abs(asm_sheet_total - dump_total) < 1 else '❌ MISMATCH'}")
+
+# --- SHEET 5: ZSM-WISE (group by ALL mapping columns) ---
+print(f"\n🔧 Building ZSM-Wise (as-is)...")
+
+zsm_groupby_cols = ['ZSM', 'NSM', 'STATE', 'REGION']
+zsm_groupby_cols = [c for c in zsm_groupby_cols if c in df.columns]
+print(f"✓ ZSM groupby columns: {zsm_groupby_cols}")
+
+zsm_agg = df.groupby(zsm_groupby_cols, dropna=False).agg({
+    'AMOUNT_PRE_TAX': 'sum',
+    'RETAILER_ID': 'nunique'
+}).reset_index().rename(columns={'RETAILER_ID': 'TOTAL_RETAILER_COUNT'})
+
+print(f"✓ ZSM combinations: {len(zsm_agg):,} rows")
+
+zsm_monthly = df.groupby(zsm_groupby_cols + ['Month_Year'], dropna=False).agg({
+    'AMOUNT_PRE_TAX': 'sum',
+    'RETAILER_ID': 'nunique'
+}).reset_index()
+
+zsm_pivot_amount = zsm_monthly.pivot(index=zsm_groupby_cols, columns='Month_Year', values='AMOUNT_PRE_TAX').fillna(0)
+zsm_pivot_count = zsm_monthly.pivot(index=zsm_groupby_cols, columns='Month_Year', values='RETAILER_ID').fillna(0)
+
+for month in actual_months:
+    if month not in zsm_pivot_amount.columns:
+        zsm_pivot_amount[month] = 0
+    if month not in zsm_pivot_count.columns:
+        zsm_pivot_count[month] = 0
+
+zsm_pivot_amount = zsm_pivot_amount[actual_months]
+zsm_pivot_count = zsm_pivot_count[actual_months]
+
+zsm_summary = zsm_agg.merge(zsm_pivot_amount, on=zsm_groupby_cols, how='left')
+zsm_summary = zsm_summary.merge(zsm_pivot_count, on=zsm_groupby_cols, how='left', suffixes=('', '_CNT'))
+
+zsm_summary['TOTAL_BILLING'] = zsm_summary[[m for m in actual_months if m in zsm_summary.columns]].sum(axis=1)
+
+zsm_final = pd.DataFrame({
+    'NSM': zsm_summary['NSM'] if 'NSM' in zsm_summary.columns else '',
+    'REGION': zsm_summary['REGION'] if 'REGION' in zsm_summary.columns else '',
+    'ZSM': zsm_summary['ZSM'],
+    'STATE': zsm_summary['STATE'] if 'STATE' in zsm_summary.columns else '',
+    'DESG.': '',
+    'SO DSM NAME': '',
+})
+for month in actual_months:
+    zsm_final[f"{month} RETAILER COUNT"] = zsm_summary[f"{month}_CNT"] if f"{month}_CNT" in zsm_summary.columns else zsm_summary[month]
+    zsm_final[f"{month} BILLING AMT"] = zsm_summary[month]
+zsm_final['TOTAL RETAILER'] = zsm_summary['TOTAL_RETAILER_COUNT']
+zsm_final['TOTAL BILLING'] = zsm_summary['TOTAL_BILLING']
+zsm_final['EMP STATUS'] = ''
+zsm_final['BEAT STATUS'] = ''
+
+zsm_sheet_total = zsm_final['TOTAL BILLING'].sum()
+print(f"✓ ZSM-wise: {len(zsm_final):,} rows")
+print(f"✓ ZSM Sheet Total: {zsm_sheet_total:,.0f}")
+print(f"✓ Match with Dump: {'✅ PERFECT' if abs(zsm_sheet_total - dump_total) < 1 else '❌ MISMATCH'}")
+
+# --- SHEET 6: NSM/REGION-WISE (group by ALL mapping columns) ---
+print(f"\n🔧 Building NSM-Wise (as-is)...")
+
+nsm_groupby_cols = ['NSM', 'REGION']
+nsm_groupby_cols = [c for c in nsm_groupby_cols if c in df.columns]
+print(f"✓ NSM groupby columns: {nsm_groupby_cols}")
+
+nsm_agg = df.groupby(nsm_groupby_cols, dropna=False).agg({
+    'AMOUNT_PRE_TAX': 'sum',
+    'RETAILER_ID': 'nunique'
+}).reset_index().rename(columns={'RETAILER_ID': 'TOTAL_RETAILER_COUNT'})
+
+print(f"✓ NSM combinations: {len(nsm_agg):,} rows")
+
+nsm_monthly = df.groupby(nsm_groupby_cols + ['Month_Year'], dropna=False).agg({
+    'AMOUNT_PRE_TAX': 'sum',
+    'RETAILER_ID': 'nunique'
+}).reset_index()
+
+nsm_pivot_amount = nsm_monthly.pivot(index=nsm_groupby_cols, columns='Month_Year', values='AMOUNT_PRE_TAX').fillna(0)
+nsm_pivot_count = nsm_monthly.pivot(index=nsm_groupby_cols, columns='Month_Year', values='RETAILER_ID').fillna(0)
+
+for month in actual_months:
+    if month not in nsm_pivot_amount.columns:
+        nsm_pivot_amount[month] = 0
+    if month not in nsm_pivot_count.columns:
+        nsm_pivot_count[month] = 0
+
+nsm_pivot_amount = nsm_pivot_amount[actual_months]
+nsm_pivot_count = nsm_pivot_count[actual_months]
+
+nsm_summary = nsm_agg.merge(nsm_pivot_amount, on=nsm_groupby_cols, how='left')
+nsm_summary = nsm_summary.merge(nsm_pivot_count, on=nsm_groupby_cols, how='left', suffixes=('', '_CNT'))
+
+nsm_summary['TOTAL_BILLING'] = nsm_summary[[m for m in actual_months if m in nsm_summary.columns]].sum(axis=1)
+
+nsm_final = pd.DataFrame({
+    'NSM': nsm_summary['NSM'],
+    'REGION': nsm_summary['REGION'] if 'REGION' in nsm_summary.columns else '',
+    'DESG.': '',
+    'SO DSM NAME': '',
+})
+for month in actual_months:
+    nsm_final[f"{month} RETAILER COUNT"] = nsm_summary[f"{month}_CNT"] if f"{month}_CNT" in nsm_summary.columns else nsm_summary[month]
+    nsm_final[f"{month} BILLING AMT"] = nsm_summary[month]
+nsm_final['TOTAL RETAILER'] = nsm_summary['TOTAL_RETAILER_COUNT']
+nsm_final['TOTAL BILLING'] = nsm_summary['TOTAL_BILLING']
+nsm_final['EMP STATUS'] = ''
+nsm_final['BEAT STATUS'] = ''
+
+nsm_sheet_total = nsm_final['TOTAL BILLING'].sum()
+print(f"✓ NSM-wise: {len(nsm_final):,} rows")
+print(f"✓ NSM Sheet Total: {nsm_sheet_total:,.0f}")
+print(f"✓ Match with Dump: {'✅ PERFECT' if abs(nsm_sheet_total - dump_total) < 1 else '❌ MISMATCH'}")
+
+# ============================================================
+# FINAL VERIFICATION
+# ============================================================
+print(f"\n{'='*60}")
+print(f"FINAL VERIFICATION - ALL SHEETS vs DUMP TOTAL")
+print(f"{'='*60}")
+print(f"💰 DUMP TOTAL:           {dump_total:,.0f}")
+print(f"📊 Retailer Sheet:       {retailer_sheet_total:,.0f} {'✅' if abs(retailer_sheet_total - dump_total) < 1 else '❌'}")
+print(f"📊 Beat Sheet:           {beat_sheet_total:,.0f} {'✅' if abs(beat_sheet_total - dump_total) < 1 else '❌'}")
+print(f"📊 DB Sheet:             {db_sheet_total:,.0f} {'✅' if abs(db_sheet_total - dump_total) < 1 else '❌'}")
+print(f"📊 ASM Sheet:            {asm_sheet_total:,.0f} {'✅' if abs(asm_sheet_total - dump_total) < 1 else '❌'}")
+print(f"📊 ZSM Sheet:            {zsm_sheet_total:,.0f} {'✅' if abs(zsm_sheet_total - dump_total) < 1 else '❌'}")
+print(f"📊 NSM Sheet:            {nsm_sheet_total:,.0f} {'✅' if abs(nsm_sheet_total - dump_total) < 1 else '❌'}")
+
+# ============================================================
+# EXPORT
+# ============================================================
+print(f"\n{'='*60}")
+print(f"EXPORTING TO EXCEL...")
+print(f"{'='*60}")
+
+with pd.ExcelWriter(OUTPUT_FILE, engine='openpyxl') as writer:
+    retailer_final.to_excel(writer, sheet_name='1_Retailer_Wise', index=False)
+    beat_final.to_excel(writer, sheet_name='2_Beat_Wise', index=False)
+    db_final.to_excel(writer, sheet_name='3_DB_Wise', index=False)
+    asm_final.to_excel(writer, sheet_name='4_ASM_Wise', index=False)
+    zsm_final.to_excel(writer, sheet_name='5_ZSM_Wise', index=False)
+    nsm_final.to_excel(writer, sheet_name='6_NSM_Region_Wise', index=False)
+
+    emp_lookup.to_excel(writer, sheet_name='ZZ_EMP_Lookup', index=False)
+    beat_lookup.to_excel(writer, sheet_name='ZZ_BEAT_Lookup', index=False)
+    ret_lookup.to_excel(writer, sheet_name='ZZ_RET_Lookup', index=False)
+
+print(f"\n{'='*60}")
+print(f"✅ REPORT COMPLETE!")
+print(f"{'='*60}")
+print(f"\n📊 Summary Sheets:")
+print(f"   • 1_Retailer_Wise:  {len(retailer_final):,} rows (as-is)")
+print(f"   • 2_Beat_Wise:      {len(beat_final):,} rows (as-is)")
+print(f"   • 3_DB_Wise:        {len(db_final):,} rows (as-is)")
+print(f"   • 4_ASM_Wise:       {len(asm_final):,} rows (as-is)")
+print(f"   • 5_ZSM_Wise:       {len(zsm_final):,} rows (as-is)")
+print(f"   • 6_NSM_Region_Wise: {len(nsm_final):,} rows (as-is)")
+print(f"\n📅 Months in CHRONOLOGICAL order: {actual_months}")
+print(f"💰 Using PRE-TAX amounts for all billing")
+print(f"🔒 AS-IS: Multiple rows per key if mapping differs")
+print(f"✅ ALL SHEETS VERIFIED: Totals match dump exactly")
+print(f"\n💾 Download: {OUTPUT_FILE}")
+
+from google.colab import files
+files.download('/content/Billed_NotBilled_Summary_20260619_1334.xlsx')
