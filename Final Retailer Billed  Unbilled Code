@@ -133,10 +133,7 @@ print(f"\n{'='*60}")
 print(f"CREATING STANDARDIZED NAME LOOKUPS")
 print(f"{'='*60}")
 
-emp_freq = df.groupby(['DSM_CODE', 'RESOURCE_NAME'], dropna=False).size().reset_index(name='COUNT')
-emp_std = emp_freq.sort_values('COUNT', ascending=False).drop_duplicates('DSM_CODE', keep='first')
-emp_lookup = emp_std[['DSM_CODE', 'RESOURCE_NAME']].rename(columns={'RESOURCE_NAME': 'STD_EMP_NAME'})
-
+# Only standardize RETAILER and BEAT names - leave employee names blank
 beat_freq = df.groupby(['BEAT_CODE', 'BEAT_NAME'], dropna=False).size().reset_index(name='COUNT')
 beat_std = beat_freq.sort_values('COUNT', ascending=False).drop_duplicates('BEAT_CODE', keep='first')
 beat_lookup = beat_std[['BEAT_CODE', 'BEAT_NAME']].rename(columns={'BEAT_NAME': 'STD_BEAT_NAME'})
@@ -145,14 +142,12 @@ ret_freq = df.groupby(['RETAILER_ID', 'RETAILER'], dropna=False).size().reset_in
 ret_std = ret_freq.sort_values('COUNT', ascending=False).drop_duplicates('RETAILER_ID', keep='first')
 ret_lookup = ret_std[['RETAILER_ID', 'RETAILER']].rename(columns={'RETAILER': 'STD_RET_NAME'})
 
-print(f"✓ Employee lookups: {len(emp_lookup):,}")
 print(f"✓ Beat lookups: {len(beat_lookup):,}")
 print(f"✓ Retailer lookups: {len(ret_lookup):,}")
 
 # ============================================================
 # STEP 4: MERGE STANDARDIZED NAMES TO DATA
 # ============================================================
-df = df.merge(emp_lookup, on='DSM_CODE', how='left')
 df = df.merge(beat_lookup, on='BEAT_CODE', how='left')
 df = df.merge(ret_lookup, on='RETAILER_ID', how='left')
 
@@ -180,7 +175,7 @@ print(f"BUILDING RETAILER MASTER (as-is, multiple rows if mapping differs)")
 print(f"{'='*60}")
 
 # Group by ALL mapping columns - if mapping same, 1 row; if mapping changes, multiple rows
-retailer_groupby_cols = ['RETAILER_ID', 'STD_RET_NAME', 'DSM_CODE', 'STD_EMP_NAME',
+retailer_groupby_cols = ['RETAILER_ID', 'STD_RET_NAME',
                           'BEAT_CODE', 'STD_BEAT_NAME', 'DB_ID', 'DB_NAME', 'DISTRIBUTOR',
                           'ZSM', 'ASM_NAME', 'SO_NAME', 'REGION', 'STATE', 'DISTRICT', 'CITY']
 retailer_groupby_cols = [c for c in retailer_groupby_cols if c in df.columns]
@@ -212,6 +207,9 @@ for month in actual_months:
 monthly_pivot = monthly_pivot[actual_months]
 monthly_pivot['TOTAL_BILLING'] = monthly_pivot.sum(axis=1)
 
+# Reset index so merge works correctly (MultiIndex -> regular columns)
+monthly_pivot = monthly_pivot.reset_index()
+
 # Verify monthly pivot total matches dump total
 monthly_pivot_total = monthly_pivot['TOTAL_BILLING'].sum()
 print(f"✓ Monthly Pivot Total: {monthly_pivot_total:,.0f}")
@@ -225,7 +223,15 @@ print(f"BUILDING SUMMARY SHEETS")
 print(f"{'='*60}")
 
 # --- SHEET 1: RETAILER-WISE (as-is, no forced deduplication) ---
-retailer_summary = retailer_agg.merge(monthly_pivot, on=retailer_groupby_cols, how='left')
+# Use monthly_pivot directly - it already has one row per unique combination
+retailer_summary = monthly_pivot.copy()
+
+# Add transaction count separately
+retailer_summary = retailer_summary.merge(
+    df.groupby(retailer_groupby_cols, dropna=False).size().reset_index(name='TRANSACTION_COUNT'),
+    on=retailer_groupby_cols, how='left'
+)
+
 for col in actual_months + ['TOTAL_BILLING']:
     retailer_summary[col] = retailer_summary[col].fillna(0)
 
@@ -245,7 +251,7 @@ retailer_final = pd.DataFrame({
     'DB ID': retailer_summary['DB_ID'] if 'DB_ID' in retailer_summary.columns else '',
     'DB NAME': retailer_summary['DB_NAME'] if 'DB_NAME' in retailer_summary.columns else '',
     'DESG.': '',
-    'SO DSM NAME': retailer_summary['STD_EMP_NAME'] if 'STD_EMP_NAME' in retailer_summary.columns else '',
+    'SO DSM NAME': '',
     'BEAT CODE': retailer_summary['BEAT_CODE'] if 'BEAT_CODE' in retailer_summary.columns else '',
     'BEAT NAME': retailer_summary['STD_BEAT_NAME'] if 'STD_BEAT_NAME' in retailer_summary.columns else '',
     'S. NO.': retailer_summary['S_NO'],
@@ -303,6 +309,10 @@ for month in actual_months:
 
 beat_pivot_amount = beat_pivot_amount[actual_months]
 beat_pivot_count = beat_pivot_count[actual_months]
+
+# Reset index so merge works correctly
+beat_pivot_amount = beat_pivot_amount.reset_index()
+beat_pivot_count = beat_pivot_count.reset_index()
 
 beat_summary = beat_agg.merge(beat_pivot_amount, on=beat_groupby_cols, how='left')
 beat_summary = beat_summary.merge(beat_pivot_count, on=beat_groupby_cols, how='left', suffixes=('', '_CNT'))
@@ -369,6 +379,10 @@ for month in actual_months:
 db_pivot_amount = db_pivot_amount[actual_months]
 db_pivot_count = db_pivot_count[actual_months]
 
+# Reset index so merge works correctly
+db_pivot_amount = db_pivot_amount.reset_index()
+db_pivot_count = db_pivot_count.reset_index()
+
 db_summary = db_agg.merge(db_pivot_amount, on=db_groupby_cols, how='left')
 db_summary = db_summary.merge(db_pivot_count, on=db_groupby_cols, how='left', suffixes=('', '_CNT'))
 
@@ -429,6 +443,10 @@ for month in actual_months:
 asm_pivot_amount = asm_pivot_amount[actual_months]
 asm_pivot_count = asm_pivot_count[actual_months]
 
+# Reset index so merge works correctly
+asm_pivot_amount = asm_pivot_amount.reset_index()
+asm_pivot_count = asm_pivot_count.reset_index()
+
 asm_summary = asm_agg.merge(asm_pivot_amount, on=asm_groupby_cols, how='left')
 asm_summary = asm_summary.merge(asm_pivot_count, on=asm_groupby_cols, how='left', suffixes=('', '_CNT'))
 
@@ -487,6 +505,10 @@ for month in actual_months:
 zsm_pivot_amount = zsm_pivot_amount[actual_months]
 zsm_pivot_count = zsm_pivot_count[actual_months]
 
+# Reset index so merge works correctly
+zsm_pivot_amount = zsm_pivot_amount.reset_index()
+zsm_pivot_count = zsm_pivot_count.reset_index()
+
 zsm_summary = zsm_agg.merge(zsm_pivot_amount, on=zsm_groupby_cols, how='left')
 zsm_summary = zsm_summary.merge(zsm_pivot_count, on=zsm_groupby_cols, how='left', suffixes=('', '_CNT'))
 
@@ -544,6 +566,10 @@ for month in actual_months:
 nsm_pivot_amount = nsm_pivot_amount[actual_months]
 nsm_pivot_count = nsm_pivot_count[actual_months]
 
+# Reset index so merge works correctly
+nsm_pivot_amount = nsm_pivot_amount.reset_index()
+nsm_pivot_count = nsm_pivot_count.reset_index()
+
 nsm_summary = nsm_agg.merge(nsm_pivot_amount, on=nsm_groupby_cols, how='left')
 nsm_summary = nsm_summary.merge(nsm_pivot_count, on=nsm_groupby_cols, how='left', suffixes=('', '_CNT'))
 
@@ -597,7 +623,6 @@ with pd.ExcelWriter(OUTPUT_FILE, engine='openpyxl') as writer:
     zsm_final.to_excel(writer, sheet_name='5_ZSM_Wise', index=False)
     nsm_final.to_excel(writer, sheet_name='6_NSM_Region_Wise', index=False)
 
-    emp_lookup.to_excel(writer, sheet_name='ZZ_EMP_Lookup', index=False)
     beat_lookup.to_excel(writer, sheet_name='ZZ_BEAT_Lookup', index=False)
     ret_lookup.to_excel(writer, sheet_name='ZZ_RET_Lookup', index=False)
 
@@ -617,5 +642,7 @@ print(f"🔒 AS-IS: Multiple rows per key if mapping differs")
 print(f"✅ ALL SHEETS VERIFIED: Totals match dump exactly")
 print(f"\n💾 Download: {OUTPUT_FILE}")
 
+
+
 from google.colab import files
-files.download('/content/Billed_NotBilled_Summary_20260619_1334.xlsx')
+files.download('/content/Billed_NotBilled_Summary_20260619_1657.xlsx')
